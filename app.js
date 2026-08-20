@@ -67,8 +67,10 @@ const playlistEl = $('playlist');
 const emptyMsg = $('emptyMsg');
 const trackCount = $('trackCount');
 const fileInput = $('fileInput');
+const folderInput = $('folderInput');
 
 const art = $('art');
+const artImg = $('artImg');
 const ytWrap = $('ytWrap');
 const npTitle = $('npTitle');
 const npSub = $('npSub');
@@ -116,6 +118,9 @@ async function init() {
   updateRepeatBtn();
   setRangeFill(seekBar);
 
+  if (tracks.length) await requestPersistentStorage();
+  updateStorageInfo();
+
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
@@ -138,6 +143,163 @@ async function migrateYouTubeUrls() {
   if (changed) toast(`유튜브 링크 ${changed}개를 재생 가능하게 고쳤어요`);
 }
 
+/* ============ storage ============ */
+// Without this the browser may evict the stored music when space runs low.
+async function requestPersistentStorage() {
+  if (!navigator.storage || !navigator.storage.persist) return false;
+  try {
+    if (await navigator.storage.persisted()) return true;
+    return await navigator.storage.persist();
+  } catch {
+    return false;
+  }
+}
+
+async function updateStorageInfo() {
+  let label = `${tracks.length}곡`;
+  try {
+    if (navigator.storage && navigator.storage.estimate) {
+      const { usage } = await navigator.storage.estimate();
+      if (usage) label += ` · ${formatBytes(usage)}`;
+    }
+    if (navigator.storage && navigator.storage.persisted) {
+      if (await navigator.storage.persisted()) label += ' · 보호됨';
+    }
+  } catch { /* estimate unsupported */ }
+  trackCount.textContent = label;
+}
+
+function formatBytes(n) {
+  if (n < 1024) return `${n}B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)}KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)}MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)}GB`;
+}
+
+/* ============ ID3 tag reading ============ */
+// Minimal ID3v2.2/2.3/2.4 reader — title, artist, album, cover art.
+async function readID3(file) {
+  try {
+    const head = new Uint8Array(await file.slice(0, 10).arrayBuffer());
+    if (head[0] !== 0x49 || head[1] !== 0x44 || head[2] !== 0x33) return null; // "ID3"
+
+    const major = head[3];
+    const tagSize = synchsafe(head, 6);
+    const buf = new Uint8Array(await file.slice(0, 10 + tagSize).arrayBuffer());
+
+    const idLen = major === 2 ? 3 : 4;
+    const headerLen = major === 2 ? 6 : 10;
+    const out = {};
+    let p = 10;
+
+    while (p + headerLen <= buf.length) {
+      const id = String.fromCharCode(...buf.slice(p, p + idLen));
+      if (!/^[A-Z0-9]+$/.test(id)) break; // padding reached
+
+      let size;
+      if (major === 2) size = (buf[p + 3] << 16) | (buf[p + 4] << 8) | buf[p + 5];
+      else if (major === 4) size = synchsafe(buf, p + 4);
+      else size = (buf[p + 4] << 24) | (buf[p + 5] << 16) | (buf[p + 6] << 8) | buf[p + 7];
+
+      if (size <= 0 || p + headerLen + size > buf.length) break;
+      const body = buf.slice(p + headerLen, p + headerLen + size);
+
+      if (id === 'TIT2' || id === 'TT2') out.title = textFrame(body);
+      else if (id === 'TPE1' || id === 'TP1') out.artist = textFrame(body);
+      else if (id === 'TALB' || id === 'TAL') out.album = textFrame(body);
+      else if (id === 'APIC' || id === 'PIC') out.picture = pictureFrame(body, major);
+
+      p += headerLen + size;
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+function synchsafe(arr, off) {
+  return (arr[off] << 21) | (arr[off + 1] << 14) | (arr[off + 2] << 7) | arr[off + 3];
+}
+
+function textFrame(body) {
+  const text = decodeText(body.slice(1), body[0]);
+  return text.replace(/\0+$/, '').trim() || null;
+}
+
+function decodeText(bytes, enc) {
+  try {
+    if (enc === 1) return new TextDecoder('utf-16').decode(bytes);
+    if (enc === 2) return new TextDecoder('utf-16be').decode(bytes);
+    if (enc === 3) return new TextDecoder('utf-8').decode(bytes);
+  } catch { /* fall through */ }
+
+  // enc 0 is declared ISO-8859-1, but Korean files commonly store EUC-KR here.
+  if (bytes.some((b) => b >= 0x80)) {
+    try {
+      const euckr = new TextDecoder('euc-kr').decode(bytes);
+      if (/[가-힣]/.test(euckr)) return euckr;
+    } catch { /* euc-kr unsupported */ }
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    } catch { /* not valid utf-8 */ }
+  }
+  try {
+    return new TextDecoder('iso-8859-1').decode(bytes);
+  } catch {
+    return '';
+  }
+}
+
+function pictureFrame(body, major) {
+  const enc = body[0];
+  let p = 1;
+  let mime;
+
+  if (major === 2) {
+    // v2.2 PIC uses a 3-character format code instead of a MIME string
+    const fmt = String.fromCharCode(...body.slice(1, 4)).toLowerCase();
+    mime = fmt === 'png' ? 'image/png' : 'image/jpeg';
+    p = 4;
+  } else {
+    const end = body.indexOf(0, p);
+    if (end < 0) return null;
+    mime = String.fromCharCode(...body.slice(p, end)) || 'image/jpeg';
+    p = end + 1;
+  }
+
+  p += 1; // picture type byte
+
+  // description, terminated by 1 or 2 nulls depending on encoding
+  if (enc === 1 || enc === 2) {
+    while (p + 1 < body.length && !(body[p] === 0 && body[p + 1] === 0)) p += 2;
+    p += 2;
+  } else {
+    while (p < body.length && body[p] !== 0) p += 1;
+    p += 1;
+  }
+
+  if (p >= body.length) return null;
+  return new Blob([body.slice(p)], { type: mime });
+}
+
+/* ============ cover art urls ============ */
+const artUrlCache = new Map();
+
+function artUrlFor(track) {
+  if (!track.picture) return null;
+  if (!artUrlCache.has(track.id)) {
+    artUrlCache.set(track.id, URL.createObjectURL(track.picture));
+  }
+  return artUrlCache.get(track.id);
+}
+
+function releaseArtUrl(id) {
+  if (artUrlCache.has(id)) {
+    URL.revokeObjectURL(artUrlCache.get(id));
+    artUrlCache.delete(id);
+  }
+}
+
 /* ============ add: sheet ============ */
 addBtn.addEventListener('click', () => openBackdrop(sheetBackdrop));
 
@@ -151,6 +313,8 @@ document.querySelectorAll('.sheet-item').forEach((btn) => {
     closeBackdrop(sheetBackdrop);
     if (kind === 'file') {
       fileInput.click();
+    } else if (kind === 'folder') {
+      folderInput.click();
     } else {
       setTimeout(() => openModal(kind), 180);
     }
@@ -161,24 +325,56 @@ function openBackdrop(el) { el.classList.add('open'); }
 function closeBackdrop(el) { el.classList.remove('open'); }
 
 /* ============ add: file ============ */
-fileInput.addEventListener('change', async () => {
-  const files = Array.from(fileInput.files || []);
+fileInput.addEventListener('change', () => importFiles(fileInput));
+folderInput.addEventListener('change', () => importFiles(folderInput));
+
+const AUDIO_EXT = /\.(mp3|m4a|aac|flac|wav|ogg|opus|wma)$/i;
+
+async function importFiles(input) {
+  const picked = Array.from(input.files || []);
+  input.value = '';
+
+  const files = picked.filter((f) => f.type.startsWith('audio/') || AUDIO_EXT.test(f.name));
+  if (!files.length) {
+    if (picked.length) toast('음악 파일을 찾지 못했어요');
+    return;
+  }
+
+  await requestPersistentStorage();
+
   let order = nextOrder();
+  let done = 0;
+
   for (const file of files) {
+    toast(`가져오는 중… ${done + 1}/${files.length}`);
+    const tag = await readID3(file);
+
     const track = {
       id: crypto.randomUUID(),
-      name: file.name.replace(/\.[^/.]+$/, ''),
+      name: (tag && tag.title) || file.name.replace(/\.[^/.]+$/, ''),
+      artist: (tag && tag.artist) || null,
+      album: (tag && tag.album) || null,
+      picture: (tag && tag.picture) || null,
       type: 'file',
       blob: file,
       order: order++,
     };
+
     await dbPut(track);
     tracks.push(track);
+    done++;
+
+    // keep the UI responsive on large folders
+    if (done % 10 === 0) {
+      renderPlaylist();
+      await new Promise((r) => setTimeout(r, 0));
+    }
   }
-  fileInput.value = '';
+
   renderPlaylist();
-  if (files.length) toast(`${files.length}곡 추가했어요`);
-});
+  updateStorageInfo();
+  toast(`${done}곡 추가했어요`);
+}
 
 function nextOrder() {
   return tracks.length ? Math.max(...tracks.map((t) => t.order)) + 1 : 0;
@@ -289,7 +485,7 @@ const KIND = {
 
 function renderPlaylist() {
   playlistEl.innerHTML = '';
-  trackCount.textContent = `${tracks.length}곡`;
+  updateStorageInfo();
   emptyMsg.classList.toggle('hidden', tracks.length > 0);
 
   tracks.forEach((track, idx) => {
@@ -304,6 +500,11 @@ function renderPlaylist() {
 
     const ico = document.createElement('div');
     ico.className = 'tk-ico';
+    const cover = artUrlFor(track);
+    if (cover) {
+      ico.classList.add('has-art');
+      ico.style.backgroundImage = `url("${cover}")`;
+    }
     const emoji = document.createElement('span');
     emoji.className = 'tk-ico-emoji';
     emoji.textContent = kind.icon;
@@ -319,7 +520,7 @@ function renderPlaylist() {
     name.textContent = track.name;
     const sub = document.createElement('div');
     sub.className = 'tk-sub';
-    sub.textContent = isCur ? '재생 중' : kind.label;
+    sub.textContent = isCur ? '재생 중' : (track.artist || kind.label);
     body.append(name, sub);
 
     main.append(ico, body);
@@ -365,6 +566,7 @@ async function removeTrack(idx) {
   if (!confirm(`"${track.name}"을(를) 삭제할까요?`)) return;
 
   await dbDelete(track.id);
+  releaseArtUrl(track.id);
   tracks.splice(idx, 1);
   tracks.forEach((t, i) => { t.order = i; });
   await Promise.all(tracks.map(dbPut));
@@ -469,10 +671,22 @@ function setNowPlaying(track) {
   if (!track) {
     npTitle.textContent = '재생 중인 곡 없음';
     npSub.textContent = tracks.length ? '곡을 눌러 재생하세요' : '위 + 를 눌러 음악을 추가하세요';
+    showCover(null);
     return;
   }
   npTitle.textContent = track.name;
-  npSub.textContent = (KIND[track.type] || KIND.url).label;
+  npSub.textContent = track.artist || (KIND[track.type] || KIND.url).label;
+  showCover(artUrlFor(track));
+}
+
+function showCover(url) {
+  if (url) {
+    artImg.src = url;
+    art.classList.add('has-art');
+  } else {
+    artImg.removeAttribute('src');
+    art.classList.remove('has-art');
+  }
 }
 
 /* ============ playback ============ */
@@ -688,10 +902,19 @@ volumeBar.addEventListener('input', () => {
 /* ============ media session ============ */
 function updateMediaSession(track) {
   if (!('mediaSession' in navigator)) return;
-  navigator.mediaSession.metadata = new MediaMetadata({
+
+  const meta = {
     title: track.name,
-    artist: '내 노래',
-  });
+    artist: track.artist || '내 노래',
+  };
+  if (track.album) meta.album = track.album;
+
+  const cover = artUrlFor(track);
+  if (cover) {
+    meta.artwork = [{ src: cover, sizes: '512x512', type: track.picture.type }];
+  }
+
+  navigator.mediaSession.metadata = new MediaMetadata(meta);
   navigator.mediaSession.setActionHandler('play', () => playBtn.click());
   navigator.mediaSession.setActionHandler('pause', () => playBtn.click());
   navigator.mediaSession.setActionHandler('previoustrack', () => prevBtn.click());

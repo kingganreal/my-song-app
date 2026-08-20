@@ -22,13 +22,20 @@ self.addEventListener('fetch', (e) => {
   if (url.origin !== location.origin) return;   // never touch YouTube / remote audio
   if (e.request.method !== 'GET') return;
 
-  e.respondWith(
-    fetch(e.request)
-      .then((res) => {
+  e.respondWith((async () => {
+    try {
+      const res = await fetch(e.request);
+      if (res && res.ok) {
         const copy = res.clone();
         caches.open(CACHE).then((c) => c.put(e.request, copy)).catch(() => {});
-        return res;
-      })
-      .catch(() => caches.match(e.request))
-  );
+      }
+      return res;
+    } catch (err) {
+      // Offline: serve the cached copy if we have one. If we don't, let the
+      // request fail as a real network error instead of resolving to undefined.
+      const cached = await caches.match(e.request);
+      if (cached) return cached;
+      throw err;
+    }
+  })());
 });

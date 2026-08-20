@@ -110,6 +110,19 @@ body {
 
 .art.active .art-glow { opacity: 0.4; }
 
+.art-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: none;
+}
+
+.art.has-art .art-img { display: block; }
+.art.has-art .art-note { display: none; }
+.art.yt .art-img { display: none; }
+
 .art-note {
   position: relative;
   font-size: 3.4rem;
@@ -272,6 +285,23 @@ body {
 }
 
 .track.playing .tk-ico { background: var(--grad); }
+
+.tk-ico.has-art {
+  background-size: cover;
+  background-position: center;
+}
+
+.tk-ico.has-art .tk-ico-emoji { display: none; }
+
+.track.playing .tk-ico.has-art::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.track.playing .tk-ico.has-art .eq { position: relative; z-index: 1; }
 
 .tk-body { min-width: 0; flex: 1; }
 

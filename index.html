@@ -25,6 +25,7 @@
   <section class="stage">
     <div class="art" id="art">
       <div class="art-glow"></div>
+      <img id="artImg" class="art-img" alt="">
       <div class="art-note" id="artNote">♪</div>
       <div class="yt-holder" id="ytWrap"><div id="ytPlayer"></div></div>
     </div>
@@ -78,9 +79,13 @@
   <div class="sheet" id="sheet">
     <div class="handle"></div>
     <h2>음악 추가</h2>
+    <button class="sheet-item" data-add="folder">
+      <span class="si-ico">🗂️</span>
+      <span class="si-text"><b>폴더 통째로</b><i>음악 폴더를 한 번에 전부 가져오기</i></span>
+    </button>
     <button class="sheet-item" data-add="file">
       <span class="si-ico">📁</span>
-      <span class="si-text"><b>기기에서 파일</b><i>mp3 · m4a · flac — 오프라인 재생</i></span>
+      <span class="si-text"><b>파일 골라서</b><i>mp3 · m4a · flac — 오프라인 재생</i></span>
     </button>
     <button class="sheet-item" data-add="yt">
       <span class="si-ico">▶️</span>
@@ -108,6 +113,7 @@
 </div>
 
 <input type="file" id="fileInput" accept="audio/*" multiple hidden>
+<input type="file" id="folderInput" webkitdirectory directory multiple hidden>
 <audio id="audio" preload="metadata"></audio>
 
 <div id="toast" class="toast"></div>
