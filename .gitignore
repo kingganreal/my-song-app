@@ -1,0 +1,14 @@
+# OS / editor junk
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# local dev helpers
+.claude/
+
+# stray media (music stays in the browser, never in the repo)
+*.mp3
+*.m4a
+*.flac
+*.wav
+*.ogg
