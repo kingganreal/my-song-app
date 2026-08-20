@@ -524,6 +524,77 @@ const KIND = {
 
 const isYtEngine = (t) => t && (t.type === 'youtube' || t.type === 'ytplaylist');
 
+/* ============ playlist contents ============ */
+// The IFrame API hands us the video ids of a playlist but only the title of
+// the video playing right now, so titles come from YouTube's public oEmbed
+// endpoint (CORS-enabled) and are cached on the track record.
+const expanded = new Set();
+const fetchingItems = new Set();
+
+async function fetchTitle(id) {
+  try {
+    const r = await fetch(
+      'https://www.youtube.com/oembed?format=json&url=' +
+      encodeURIComponent('https://www.youtube.com/watch?v=' + id)
+    );
+    if (!r.ok) return null;
+    const j = await r.json();
+    return {
+      title: j.title || null,
+      author: (j.author_name || '').replace(/\s*-\s*Topic$/, '') || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchPlaylistItems(track, ids) {
+  if (fetchingItems.has(track.id)) return;
+  fetchingItems.add(track.id);
+
+  try {
+    const items = new Array(ids.length);
+    let next = 0;
+    let done = 0;
+
+    const worker = async () => {
+      while (next < ids.length) {
+        const k = next++;
+        const info = await fetchTitle(ids[k]);
+        items[k] = {
+          id: ids[k],
+          title: (info && info.title) || '제목 없음',
+          author: (info && info.author) || '',
+        };
+        done++;
+        if (done % 20 === 0) toast(`목록 불러오는 중… ${done}/${ids.length}`);
+      }
+    };
+
+    await Promise.all(Array.from({ length: 6 }, worker));
+
+    track.items = items;
+    await dbPut(track);
+    renderPlaylist();
+    toast(`${items.length}곡 목록을 불러왔어요`);
+  } finally {
+    fetchingItems.delete(track.id);
+  }
+}
+
+function playPlaylistAt(track, index) {
+  const isCurrent = tracks[currentIndex] && tracks[currentIndex].id === track.id;
+  if (isCurrent && ytPlayer && ytPlayer.playVideoAt) {
+    ytPlayer.playVideoAt(index);
+    return;
+  }
+  pendingPlaylistIndex = index;
+  playIndex(tracks.indexOf(track));
+}
+
+let pendingPlaylistIndex = -1;
+let lastPlaylistIndex = -1;
+
 function renderPlaylist() {
   playlistEl.innerHTML = '';
   updateStorageInfo();
@@ -585,10 +656,81 @@ function renderPlaylist() {
     del.setAttribute('aria-label', '삭제');
     del.addEventListener('click', (e) => { e.stopPropagation(); removeTrack(idx); });
 
+    const row = document.createElement('div');
+    row.className = 'track-row';
+
+    if (track.type === 'ytplaylist') {
+      const isOpen = expanded.has(track.id);
+      const toggle = document.createElement('button');
+      toggle.className = 'expand' + (isOpen ? ' open' : '');
+      toggle.textContent = '⌄';
+      toggle.setAttribute('aria-label', isOpen ? '목록 접기' : '목록 펼치기');
+      toggle.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (isOpen) expanded.delete(track.id);
+        else expanded.add(track.id);
+        renderPlaylist();
+      });
+      actions.insertBefore(toggle, actions.firstChild);
+    }
+
     actions.append(up, down, del);
-    li.append(main, actions);
+    row.append(main, actions);
+    li.append(row);
+
+    if (track.type === 'ytplaylist' && expanded.has(track.id)) {
+      li.appendChild(buildSubList(track));
+    }
+
     playlistEl.appendChild(li);
   });
+}
+
+function buildSubList(track) {
+  const box = document.createElement('div');
+  box.className = 'sub-list';
+
+  if (!track.items || !track.items.length) {
+    const note = document.createElement('p');
+    note.className = 'sub-note';
+    note.textContent = fetchingItems.has(track.id)
+      ? '목록을 불러오는 중이에요…'
+      : '재생을 시작하면 곡 목록을 불러옵니다.';
+    box.appendChild(note);
+    return box;
+  }
+
+  const isCurrent = tracks[currentIndex] && tracks[currentIndex].id === track.id;
+  const at = isCurrent && ytPlayer && ytPlayer.getPlaylistIndex ? ytPlayer.getPlaylistIndex() : -1;
+
+  track.items.forEach((item, i) => {
+    const el = document.createElement('button');
+    el.className = 'sub-item' + (i === at ? ' playing' : '');
+    el.innerHTML = '';
+
+    const num = document.createElement('span');
+    num.className = 'sub-num';
+    num.textContent = i === at ? '▶' : String(i + 1);
+
+    const body = document.createElement('span');
+    body.className = 'sub-body';
+    const t = document.createElement('span');
+    t.className = 'sub-title';
+    t.textContent = item.title;
+    body.appendChild(t);
+    if (item.author) {
+      const a = document.createElement('span');
+      a.className = 'sub-artist';
+      a.textContent = item.author;
+      body.appendChild(a);
+    }
+
+    el.append(num, body);
+    el.addEventListener('click', () => playPlaylistAt(track, i));
+    box.appendChild(el);
+  });
+
+  return box;
 }
 
 async function moveTrack(idx, dir) {
@@ -691,6 +833,17 @@ function startYtTick() {
       npSub.textContent = list.length
         ? `${track.name} · ${at + 1}/${list.length}`
         : track.name;
+
+      // Once YouTube reports the contents, resolve the titles one time.
+      if (list.length && (!track.items || track.items.length !== list.length)) {
+        fetchPlaylistItems(track, list.slice());
+      }
+
+      // Keep the expanded list's "now playing" marker in step.
+      if (at !== lastPlaylistIndex) {
+        lastPlaylistIndex = at;
+        if (expanded.has(track.id)) renderPlaylist();
+      }
     }
   }, 500);
 }
@@ -765,7 +918,9 @@ async function playIndex(idx) {
     try {
       const player = await createYtPlayer();
       if (track.type === 'ytplaylist') {
-        player.loadPlaylist({ list: track.playlistId, listType: 'playlist', index: 0 });
+        const startAt = pendingPlaylistIndex > 0 ? pendingPlaylistIndex : 0;
+        pendingPlaylistIndex = -1;
+        player.loadPlaylist({ list: track.playlistId, listType: 'playlist', index: startAt });
       } else {
         player.loadVideoById(track.videoId);
       }
