@@ -386,10 +386,10 @@ function openModal(mode) {
   modalName.value = '';
   modalUrl.value = '';
   if (mode === 'yt') {
-    modalTitle.textContent = '유튜브 링크 추가';
-    modalUrl.placeholder = 'https://music.youtube.com/watch?v=...';
+    modalTitle.textContent = '유튜브 추가';
+    modalUrl.placeholder = '영상 또는 재생목록 링크';
     modalHint.textContent =
-      '유튜브 공식 플레이어로 재생됩니다. 인터넷이 필요하고, 화면을 끄면 재생이 멈춥니다.';
+      '재생목록 링크를 넣으면 전체가 통째로 들어갑니다. 유튜브 공식 플레이어로 재생되며, 광고가 나오고 인터넷이 필요합니다. 화면을 끄면 멈춥니다.';
   } else {
     modalTitle.textContent = '오디오 주소 추가';
     modalUrl.placeholder = 'https://example.com/song.mp3';
@@ -413,10 +413,19 @@ modalSave.addEventListener('click', async () => {
   const raw = modalUrl.value.trim();
   if (!raw) return;
 
+  const listId = parseYouTubePlaylistId(raw);
   const ytId = parseYouTubeId(raw);
   let track;
 
-  if (modalMode === 'yt' || ytId) {
+  if (listId) {
+    track = {
+      id: crypto.randomUUID(),
+      name: modalName.value.trim() || '유튜브 재생목록',
+      type: 'ytplaylist',
+      playlistId: listId,
+      order: nextOrder(),
+    };
+  } else if (modalMode === 'yt' || ytId) {
     if (!ytId) {
       toast('유튜브 링크를 인식하지 못했어요');
       return;
@@ -466,8 +475,10 @@ function parseYouTubeId(input) {
   const v = u.searchParams.get('v');
   if (v) return validId(v);
 
+  // "/embed/videoseries?list=..." is a playlist embed, not a video — and
+  // "videoseries" is itself 11 characters, so it must be excluded explicitly.
   const m = u.pathname.match(/\/(embed|shorts|live|v)\/([\w-]{11})/);
-  if (m) return validId(m[2]);
+  if (m && m[2] !== 'videoseries') return validId(m[2]);
 
   return null;
 }
@@ -476,12 +487,42 @@ function validId(id) {
   return /^[\w-]{11}$/.test(id) ? id : null;
 }
 
+// Returns a playlist id only when the link really points at a playlist.
+// "watch?v=X&list=Y" is treated as the single video X, since that is what
+// clicking a track inside a playlist gives you.
+function parseYouTubePlaylistId(input) {
+  let u;
+  try {
+    u = new URL(input);
+  } catch {
+    return /^(PL|OL|UU|LL|FL|RD)[\w-]{10,}$/.test(input) ? input : null;
+  }
+  const host = u.hostname.replace(/^www\./, '');
+  const isYt =
+    host === 'youtube.com' || host === 'm.youtube.com' ||
+    host === 'music.youtube.com' || host === 'youtube-nocookie.com';
+  if (!isYt) return null;
+
+  const list = u.searchParams.get('list');
+  if (!list) return null;
+
+  const isPlaylistPath =
+    u.pathname === '/playlist' ||
+    u.pathname.startsWith('/embed/videoseries') ||
+    !u.searchParams.get('v');
+
+  return isPlaylistPath ? list : null;
+}
+
 /* ============ render ============ */
 const KIND = {
   file: { icon: '🎵', label: '내 파일' },
   url: { icon: '🔗', label: '링크' },
   youtube: { icon: '▶️', label: '유튜브' },
+  ytplaylist: { icon: '📃', label: '유튜브 재생목록' },
 };
+
+const isYtEngine = (t) => t && (t.type === 'youtube' || t.type === 'ytplaylist');
 
 function renderPlaylist() {
   playlistEl.innerHTML = '';
@@ -636,6 +677,21 @@ function startYtTick() {
     curTimeEl.textContent = formatTime(cur);
     durTimeEl.textContent = formatTime(dur);
     updatePlayBtn();
+
+    // For a playlist, show whichever video YouTube is currently on.
+    const track = tracks[currentIndex];
+    if (track && track.type === 'ytplaylist' && ytPlayer.getVideoData) {
+      const data = ytPlayer.getVideoData() || {};
+      if (data.title && npTitle.textContent !== data.title) {
+        npTitle.textContent = data.title;
+        updateMediaSession({ ...track, name: data.title, artist: data.author });
+      }
+      const list = ytPlayer.getPlaylist() || [];
+      const at = ytPlayer.getPlaylistIndex();
+      npSub.textContent = list.length
+        ? `${track.name} · ${at + 1}/${list.length}`
+        : track.name;
+    }
   }, 500);
 }
 
@@ -700,7 +756,7 @@ async function playIndex(idx) {
   setNowPlaying(track);
   art.classList.add('active');
 
-  if (track.type === 'youtube') {
+  if (isYtEngine(track)) {
     audio.pause();
     audio.removeAttribute('src');
     engine = 'yt';
@@ -708,7 +764,11 @@ async function playIndex(idx) {
     art.classList.remove('spinning');
     try {
       const player = await createYtPlayer();
-      player.loadVideoById(track.videoId);
+      if (track.type === 'ytplaylist') {
+        player.loadPlaylist({ list: track.playlistId, listType: 'playlist', index: 0 });
+      } else {
+        player.loadVideoById(track.videoId);
+      }
       player.setVolume(Math.round(parseFloat(volumeBar.value) * 100));
       startYtTick();
     } catch {
@@ -781,10 +841,31 @@ prevBtn.addEventListener('click', () => {
     ? ytPlayer.getCurrentTime()
     : audio.currentTime;
   if (cur > 3) { seekTo(0); return; }
+  if (playlistStep(-1)) return;
   goRelative(-1);
 });
 
-nextBtn.addEventListener('click', () => goRelative(1));
+nextBtn.addEventListener('click', () => {
+  if (playlistStep(1)) return;
+  goRelative(1);
+});
+
+// Inside a YouTube playlist, prev/next move within the playlist rather than
+// jumping to another entry in our own list. Returns true when handled.
+function playlistStep(dir) {
+  const track = tracks[currentIndex];
+  if (!track || track.type !== 'ytplaylist' || !ytPlayer || !ytPlayer.getPlaylist) return false;
+
+  const list = ytPlayer.getPlaylist() || [];
+  const at = ytPlayer.getPlaylistIndex();
+  if (!list.length || at < 0) return false;
+
+  const next = at + dir;
+  if (next < 0 || next >= list.length) return false;
+
+  ytPlayer.playVideoAt(next);
+  return true;
+}
 
 function goRelative(dir) {
   if (!tracks.length) return;
@@ -798,6 +879,15 @@ function goRelative(dir) {
 audio.addEventListener('ended', handleEnded);
 
 function handleEnded() {
+  // YouTube fires "ended" after every video in a playlist and advances on its
+  // own, so only fall through to our own list once the playlist is finished.
+  const cur = tracks[currentIndex];
+  if (cur && cur.type === 'ytplaylist' && ytPlayer && ytPlayer.getPlaylist) {
+    const list = ytPlayer.getPlaylist() || [];
+    const at = ytPlayer.getPlaylistIndex();
+    if (list.length && at > -1 && at < list.length - 1) return;
+  }
+
   if (repeatMode === 'one') {
     seekTo(0);
     if (engine === 'yt') ytPlayer.playVideo();
